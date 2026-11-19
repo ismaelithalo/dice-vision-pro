@@ -1,0 +1,38 @@
+# Ambientes virtuais Python
+.venv/
+venv/
+env/
+ENV/
+
+# Bytecode e cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Distribuição e packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Modelos e caches do EasyOCR / PyTorch
+.EasyOCR/
+*.pth
+*.pt
+*.onnx
+
+# Artefatos de debug e testes locais
+debug_output/
+*.log
+*.tmp
+
+# SO e IDEs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
