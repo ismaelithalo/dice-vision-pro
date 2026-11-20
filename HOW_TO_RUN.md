@@ -49,6 +49,20 @@ pip install -r requirements.txt
 
 > **Nota:** Na primeira execução do `EasyOCR`, os pesos do modelo de detecção e reconhecimento serão baixados automaticamente para `~/.EasyOCR/model/`.
 
+### 3.1. Habilitando GPU NVIDIA (CUDA) no Windows
+
+Por padrão no Windows, o `pip install -r requirements.txt` instala a versão **CPU** do PyTorch (`+cpu`). Para utilizar sua placa NVIDIA (especialmente placas **RTX série 50 / Blackwell**, como a RTX 5060, que exigem **CUDA 12.8+**), reinstale o `torch` e `torchvision` apontando para o índice CUDA do PyTorch:
+
+```powershell
+pip install --upgrade --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128
+```
+
+Para confirmar que a GPU foi reconhecida antes de rodar o programa:
+
+```powershell
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
 ---
 
 ## 4. Exemplos de Execução

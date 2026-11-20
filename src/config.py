@@ -19,6 +19,24 @@ def detect_gpu_available() -> bool:
         return False
 
 
+def get_hardware_info(use_gpu: bool) -> str:
+    """Retorna uma descrição legível do dispositivo de inferência ativo (GPU CUDA ou CPU)."""
+    if not use_gpu:
+        if detect_gpu_available():
+            return "CPU (forcado via CLI)"
+        return "CPU (CUDA indisponivel)"
+
+    try:
+        import torch  # type: ignore[import-not-found]
+
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            return f"GPU: {name} (CUDA)"
+    except Exception:
+        pass
+    return "GPU (CUDA)"
+
+
 # Flag padrão de GPU com detecção automática e fallback seguro para CPU (False)
 AUTO_DETECTED_GPU: bool = detect_gpu_available()
 USE_GPU: bool = AUTO_DETECTED_GPU if AUTO_DETECTED_GPU else False

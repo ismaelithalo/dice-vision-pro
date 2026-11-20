@@ -14,9 +14,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import DEFAULT_CONFIG, DiceConfig, detect_gpu_available
+from src.config import DEFAULT_CONFIG, DiceConfig, detect_gpu_available, get_hardware_info
 from src.detector import DiceSegmenter, MotionStabilityDetector
-from src.main import build_arg_parser
+from src.main import build_arg_parser, draw_stats_overlay
 from src.ocr_engine import DiceOCREngine
 
 
@@ -230,3 +230,23 @@ def test_segmenter_detects_close_large_dice() -> None:
     assert roi is not None
     _, _, w, h = roi.bbox
     assert w >= 200 and h >= 200
+
+
+def test_hardware_info_and_stats_overlay() -> None:
+    """Verifica a descrição de hardware (CPU/GPU) e a renderização do overlay de estatísticas."""
+    cpu_info = get_hardware_info(False)
+    gpu_info = get_hardware_info(True)
+    assert "CPU" in cpu_info
+    assert "GPU" in gpu_info
+
+    canvas = np.zeros((480, 640, 3), dtype=np.uint8)
+    rendered = draw_stats_overlay(
+        canvas,
+        [
+            f"Dispositivo: {cpu_info}",
+            "FPS: 30.0 | Frame: 640x480",
+            "Movimento: 0.00% | ROI: 100x100",
+        ],
+    )
+    assert rendered.shape == canvas.shape
+    assert np.any(rendered > 0)
