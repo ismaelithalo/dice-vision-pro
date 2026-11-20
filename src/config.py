@@ -61,13 +61,14 @@ class DiceConfig:
     use_adaptive_threshold: bool = False  # Se False, utiliza contraste local + distância de cor (Lab) + Otsu
     adaptive_block_size: int = 19
     adaptive_c: int = 4
-    min_foreground_diff: int = 18  # Limiar mínimo de contraste para evitar segmentação de ruído em quadros vazios
-    min_contour_area: int = 400
+    min_foreground_diff: int = 28  # Limiar mínimo de contraste (maior = menos sensível a sombras e ruídos)
+    min_contour_area: int = 1200
     max_contour_area: int = 280000
+    max_dice_count: int = 12  # Limite máximo de dados segmentados simultaneamente por quadro
     roi_padding_px: int = 8
 
     # --- Recorte Central da Face Superior (Redução de Faces Laterais) ---
-    center_crop_ratio: float = 0.68  # Fração central do bounding box preservada para priorizar a face superior
+    center_crop_ratio: float = 0.55  # Fração central do polígono preservada para isolar apenas a face superior
     apply_circular_mask: bool = True
 
     # --- Pré-processamento & OCR Rotacionado ---

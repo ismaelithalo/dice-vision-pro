@@ -61,12 +61,14 @@ class DiceOCREngine:
                 self._reader = easyocr.Reader(
                     ["en"],
                     gpu=bool(self.config.use_gpu),
+                    recog_network="english_g2",
+                    quantize=False,
                     verbose=False,
                 )
         return self._reader
 
     def preprocess_roi(self, roi_image: np.ndarray) -> np.ndarray:
-        """Aplica conversão para escala de cinza, redimensionamento, CLAHE e leve nitidez."""
+        """Aplica escala de cinza, suavização preservando bordas, normalização de contraste e margem silenciosa."""
         if roi_image.size == 0:
             raise ValueError("A imagem de ROI fornecida para o pré-processamento está vazia.")
 
@@ -75,19 +77,38 @@ class DiceOCREngine:
         else:
             gray = roi_image.copy()
 
-        resized = cv2.resize(
-            gray,
-            self.config.ocr_target_size,
-            interpolation=cv2.INTER_CUBIC,
-        )
+        target_w, target_h = self.config.ocr_target_size
+        inner_w = max(32, int(target_w * 0.72))
+        inner_h = max(32, int(target_h * 0.72))
 
-        clahe = cv2.createCLAHE(
-            clipLimit=self.config.clahe_clip_limit,
-            tileGridSize=self.config.clahe_tile_grid_size,
+        resized = cv2.resize(gray, (inner_w, inner_h), interpolation=cv2.INTER_CUBIC)
+        denoised = cv2.bilateralFilter(resized, d=5, sigmaColor=40, sigmaSpace=40)
+
+        # Normalização linear preserva traços dos dígitos sem amplificar granulação do dado como CLAHE forte
+        normalized = cv2.normalize(denoised, None, 0, 255, cv2.NORM_MINMAX)
+
+        border_val = int(np.median(normalized))
+        canvas = np.full((target_h, target_w), border_val, dtype=np.uint8)
+        x0 = (target_w - inner_w) // 2
+        y0 = (target_h - inner_h) // 2
+        canvas[y0 : y0 + inner_h, x0 : x0 + inner_w] = normalized
+        return canvas
+
+    @staticmethod
+    def _build_adaptive_binary_variant(preprocessed: np.ndarray) -> np.ndarray:
+        """Gera versão binarizada limpa (texto escuro em fundo branco) para iluminação difícil."""
+        binary = cv2.adaptiveThreshold(
+            preprocessed,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            8,
         )
-        enhanced = clahe.apply(resized)
-        denoised = cv2.GaussianBlur(enhanced, (3, 3), 0)
-        return denoised
+        # Se a maior parte da imagem ficou preta, inverte para manter texto escuro sobre fundo branco
+        if np.mean(binary) < 127.0:
+            binary = cv2.bitwise_not(binary)
+        return binary
 
     @staticmethod
     def rotate_image(image: np.ndarray, angle_deg: float) -> np.ndarray:
@@ -131,21 +152,74 @@ class DiceOCREngine:
         detections: Sequence[Any],
         angle_deg: int,
     ) -> list[OCRCandidate]:
-        """Converte a saída do EasyOCR em candidatos validados no intervalo permitido."""
+        """Converte a saída do EasyOCR em candidatos validados, unindo dígitos adjacentes (ex: '1' + '2' -> 12)."""
         candidates: list[OCRCandidate] = []
+        raw_boxes: list[tuple[float, float, float, float, str, float]] = []
+
         for item in detections:
             if not isinstance(item, (list, tuple)) or len(item) < 3:
                 continue
-            _, raw_text, confidence = item[0], str(item[1]), float(item[2])
+            box, raw_text, confidence = item[0], str(item[1]), float(item[2])
             if confidence < self.config.min_ocr_confidence:
                 continue
 
-            value = self.parse_and_validate_number(raw_text)
+            cleaned = re.sub(r"[^0-9]", "", raw_text.strip())
+            if not cleaned:
+                continue
+
+            if isinstance(box, (list, tuple)) and len(box) >= 4:
+                xs = [float(p[0]) for p in box]
+                ys = [float(p[1]) for p in box]
+                cx = sum(xs) / len(xs)
+                cy = sum(ys) / len(ys)
+                bw = max(1.0, max(xs) - min(xs))
+                bh = max(1.0, max(ys) - min(ys))
+                raw_boxes.append((cx, cy, bw, bh, cleaned, confidence))
+            else:
+                value = self.parse_and_validate_number(cleaned)
+                if value is not None:
+                    candidates.append(
+                        OCRCandidate(
+                            value=value,
+                            raw_text=raw_text,
+                            confidence=confidence,
+                            angle_deg=angle_deg,
+                        )
+                    )
+
+        # Une dígitos alinhados horizontalmente (ex: '1' e '2' formando '12') antes de emitir fragmentos isolados
+        used_indices: set[int] = set()
+        if len(raw_boxes) >= 2:
+            raw_boxes.sort(key=lambda b: b[0])
+            for i in range(len(raw_boxes) - 1):
+                if i in used_indices:
+                    continue
+                cx1, cy1, bw1, bh1, t1, c1 = raw_boxes[i]
+                cx2, cy2, bw2, bh2, t2, c2 = raw_boxes[i + 1]
+                avg_h = (bh1 + bh2) * 0.5
+                if abs(cy1 - cy2) <= avg_h * 0.45 and (cx2 - cx1) <= (bw1 + bw2) * 1.1:
+                    merged_val = self.parse_and_validate_number(t1 + t2)
+                    if merged_val is not None:
+                        candidates.append(
+                            OCRCandidate(
+                                value=merged_val,
+                                raw_text=t1 + t2,
+                                confidence=(c1 + c2) * 0.5,
+                                angle_deg=angle_deg,
+                            )
+                        )
+                        used_indices.add(i)
+                        used_indices.add(i + 1)
+
+        for idx, (_, _, _, _, cleaned, confidence) in enumerate(raw_boxes):
+            if idx in used_indices:
+                continue
+            value = self.parse_and_validate_number(cleaned)
             if value is not None:
                 candidates.append(
                     OCRCandidate(
                         value=value,
-                        raw_text=raw_text,
+                        raw_text=cleaned,
                         confidence=confidence,
                         angle_deg=angle_deg,
                     )
@@ -160,24 +234,43 @@ class DiceOCREngine:
 
         all_candidates: list[OCRCandidate] = []
 
-        # Testamos a polaridade original do CLAHE e sua versão invertida caso nenhuma leitura de alta confiança surja
-        variants = [preprocessed, cv2.bitwise_not(preprocessed)]
+        # Testa polaridade original, invertida e binarização adaptativa se ainda não houver leitura sólida
+        variants = [
+            preprocessed,
+            255 - preprocessed,
+            self._build_adaptive_binary_variant(preprocessed),
+        ]
 
         for variant_idx, base_img in enumerate(variants):
             for angle in angles:
                 rotated = self.rotate_image(base_img, angle) if angle != 0 else base_img
-                detections = reader.readtext(
-                    rotated,
-                    allowlist=self.config.ocr_allowlist,
-                    detail=1,
-                    paragraph=False,
-                )
+                try:
+                    detections = reader.readtext(
+                        rotated,
+                        decoder="beamsearch",
+                        beamWidth=5,
+                        allowlist=self.config.ocr_allowlist,
+                        detail=1,
+                        paragraph=False,
+                        min_size=10,
+                        text_threshold=0.65,
+                        low_text=0.35,
+                        mag_ratio=1.5,
+                    )
+                except TypeError:
+                    detections = reader.readtext(
+                        rotated,
+                        allowlist=self.config.ocr_allowlist,
+                        detail=1,
+                        paragraph=False,
+                    )
+
                 all_candidates.extend(
                     self._collect_candidates_from_detections(detections, angle)
                 )
 
-            # Se a polaridade padrão já encontrou uma leitura sólida, evitamos dobrar o custo na imagem invertida
-            if variant_idx == 0 and any(c.confidence >= 0.75 for c in all_candidates):
+            # Se já encontrou uma leitura sólida, evita rodar passagens extras
+            if any(c.confidence >= 0.75 for c in all_candidates):
                 break
 
         if not all_candidates:
@@ -189,7 +282,17 @@ class DiceOCREngine:
                 candidates=[],
             )
 
-        best_candidate = max(all_candidates, key=lambda c: c.confidence)
+        # Consenso multi-ângulo: favorece valores consistentes em múltiplos ângulos em vez de ruídos isolados
+        by_value: dict[int, list[OCRCandidate]] = {}
+        for cand in all_candidates:
+            by_value.setdefault(cand.value, []).append(cand)
+
+        def _value_score(cands: list[OCRCandidate]) -> float:
+            best_conf = max(c.confidence for c in cands)
+            return best_conf + 0.12 * min(3, len(cands) - 1)
+
+        winning_cands = max(by_value.values(), key=_value_score)
+        best_candidate = max(winning_cands, key=lambda c: c.confidence)
         return OCRResult(
             value=best_candidate.value,
             confidence=best_candidate.confidence,
