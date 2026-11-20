@@ -40,10 +40,11 @@ class DiceConfig:
 
     # --- Segmentação e Contorno do Dado ---
     blur_kernel_size: tuple[int, int] = (5, 5)
-    use_adaptive_threshold: bool = False  # Se False, utiliza Otsu + Canny combinados
+    use_adaptive_threshold: bool = False  # Se False, utiliza contraste local + distância de cor (Lab) + Otsu
     adaptive_block_size: int = 19
     adaptive_c: int = 4
-    min_contour_area: int = 1200
+    min_foreground_diff: int = 18  # Limiar mínimo de contraste para evitar segmentação de ruído em quadros vazios
+    min_contour_area: int = 400
     max_contour_area: int = 280000
     roi_padding_px: int = 8
 

@@ -193,3 +193,40 @@ def test_cli_argument_parser() -> None:
     assert args.camera == 1
     assert args.image == "teste.jpg"
     assert args.debug is True
+
+
+def test_segmenter_ignores_lighting_gradient_and_corner_artifacts() -> None:
+    """Garante que gradientes de iluminação nos cantos não sequestrem a detecção do dado."""
+    # Cria fundo 640x480 com gradiente forte (escuro em cima/esquerda, claro em baixo/direita)
+    y_grad = np.linspace(30, 170, 480, dtype=np.float32)[:, None]
+    x_grad = np.linspace(0, 50, 640, dtype=np.float32)[None, :]
+    bg = np.clip(y_grad + x_grad, 0, 255).astype(np.uint8)
+    empty_frame = cv2.merge([bg, bg, bg])
+
+    segmenter = DiceSegmenter()
+    # Em quadro vazio com gradiente, nenhum dado deve ser detectado no canto
+    assert segmenter.detect_dice_roi(empty_frame) is None
+
+    # Adiciona um dado colorido (vermelho) próximo ao centro com luminância parecida à do fundo
+    frame_with_dice = empty_frame.copy()
+    cv2.rectangle(frame_with_dice, (280, 200), (350, 270), (40, 40, 210), thickness=-1)
+    roi = segmenter.detect_dice_roi(frame_with_dice)
+    assert roi is not None
+    x, y, w, h = roi.bbox
+    cx, cy = x + w / 2.0, y + h / 2.0
+    assert 260 <= cx <= 370
+    assert 180 <= cy <= 290
+
+
+def test_segmenter_detects_close_large_dice() -> None:
+    """Garante que um dado grande (aproximado da câmera) seja detectado corretamente."""
+    frame = np.full((480, 640, 3), 35, dtype=np.uint8)
+    # Dado grande (240x240) centralizado
+    cv2.rectangle(frame, (200, 120), (440, 360), (225, 225, 225), thickness=-1)
+    cv2.putText(frame, "15", (270, 260), cv2.FONT_HERSHEY_SIMPLEX, 2.5, (20, 20, 20), 5)
+
+    segmenter = DiceSegmenter()
+    roi = segmenter.detect_dice_roi(frame)
+    assert roi is not None
+    _, _, w, h = roi.bbox
+    assert w >= 200 and h >= 200

@@ -122,10 +122,11 @@ class DiceSegmenter:
         self.config = config
 
     def compute_foreground_mask(self, frame: np.ndarray) -> np.ndarray:
-        """Gera máscara binária do dado em relação ao fundo uniforme via Otsu ou Adaptive Threshold.
+        """Gera máscara binária do dado sobre o fundo usando contraste local e distância de cor (Lab).
 
-        Seleciona automaticamente a polaridade (dado claro em fundo escuro ou dado escuro em fundo claro)
-        observando a intensidade predominante das bordas do frame.
+        A estimativa de fundo suavizada (em baixa resolução) remove gradientes de iluminação e
+        vinhetas nos cantos da câmera, enquanto os canais de crominância (a, b) permitem detectar
+        dados coloridos mesmo quando possuem luminância parecida com a da mesa.
         """
         if frame.ndim == 3:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -145,17 +146,40 @@ class DiceSegmenter:
                 self.config.adaptive_c,
             )
         else:
-            _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            # Se as bordas da imagem estiverem majoritariamente brancas (255), invertemos para que o fundo seja 0
-            border_pixels = np.concatenate(
-                [mask[0, :], mask[-1, :], mask[:, 0], mask[:, -1]]
-            )
-            if np.mean(border_pixels) > 127.0:
-                mask = cv2.bitwise_not(mask)
+            h, w = blurred.shape[:2]
+            # Estima o fundo localmente em escala reduzida para ser imune a sombras/vinhetas nos cantos
+            bg_w, bg_h = max(16, w // 8), max(16, h // 8)
+            small_gray = cv2.resize(blurred, (bg_w, bg_h), interpolation=cv2.INTER_AREA)
+            small_bg = cv2.GaussianBlur(small_gray, (21, 21), 0)
+            local_bg = cv2.resize(small_bg, (w, h), interpolation=cv2.INTER_LINEAR)
+            fg_score = cv2.absdiff(blurred, local_bg)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+            if frame.ndim == 3 and frame.shape[2] == 3:
+                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
+                small_lab = cv2.resize(lab, (bg_w, bg_h), interpolation=cv2.INTER_AREA)
+                med_a = int(np.median(small_lab[:, :, 1]))
+                med_b = int(np.median(small_lab[:, :, 2]))
+                diff_a = cv2.absdiff(lab[:, :, 1], np.full((h, w), med_a, dtype=np.uint8))
+                diff_b = cv2.absdiff(lab[:, :, 2], np.full((h, w), med_b, dtype=np.uint8))
+                chroma_diff = cv2.add(diff_a, diff_b)
+                fg_score = cv2.max(fg_score, chroma_diff)
+
+            fg_score = cv2.GaussianBlur(fg_score, self.config.blur_kernel_size, 0)
+            min_diff = max(1, int(self.config.min_foreground_diff))
+
+            if int(np.max(fg_score)) < min_diff:
+                return np.zeros((h, w), dtype=np.uint8)
+
+            otsu_thresh, mask = cv2.threshold(
+                fg_score, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            if otsu_thresh < min_diff:
+                _, mask = cv2.threshold(fg_score, min_diff, 255, cv2.THRESH_BINARY)
+
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
         return mask
 
     def extract_top_face_crop(self, full_crop: np.ndarray) -> np.ndarray:
@@ -194,6 +218,11 @@ class DiceSegmenter:
 
         frame_h, frame_w = frame.shape[:2]
         frame_center = np.array([frame_w / 2.0, frame_h / 2.0])
+        effective_max_area = min(
+            float(self.config.max_contour_area),
+            float(frame_w * frame_h) * 0.55,
+        )
+        border_margin = 2
 
         best_contour: Optional[np.ndarray] = None
         best_area: float = 0.0
@@ -202,21 +231,46 @@ class DiceSegmenter:
 
         for contour in contours:
             area = float(cv2.contourArea(contour))
-            if area < self.config.min_contour_area or area > self.config.max_contour_area:
+            if area < self.config.min_contour_area or area > effective_max_area:
                 continue
 
             x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = w / float(h) if h > 0 else 0.0
-            if aspect_ratio < 0.35 or aspect_ratio > 2.85:
+            if w <= 0 or h <= 0:
                 continue
 
-            # Prioriza contornos grandes e próximos ao centro da imagem
+            # Descarta artefatos ancorados nos cantos/bordas da imagem (sombras, vinhetas, borda da mesa)
+            edges_touched = (
+                int(x <= border_margin)
+                + int(y <= border_margin)
+                + int((x + w) >= (frame_w - border_margin))
+                + int((y + h) >= (frame_h - border_margin))
+            )
+            if edges_touched >= 2:
+                continue
+
+            aspect_ratio = w / float(h)
+            if aspect_ratio < 0.40 or aspect_ratio > 2.50:
+                continue
+
+            extent = area / float(w * h)
+            if extent < 0.35:
+                continue
+
+            hull = cv2.convexHull(contour)
+            hull_area = float(cv2.contourArea(hull))
+            solidity = area / hull_area if hull_area > 0 else 0.0
+            if solidity < 0.60:
+                continue
+
+            # Pontuação equilibrada: favorece objetos convexos, centralizados e sem dominar por área excessiva
             cx = x + w / 2.0
             cy = y + h / 2.0
             dist = float(np.linalg.norm(np.array([cx, cy]) - frame_center))
             max_dist = max(1.0, float(np.hypot(frame_w, frame_h)))
             centrality = 1.0 - (dist / max_dist)
-            score = area * (0.5 + 0.5 * centrality)
+            score = (area ** 0.5) * (0.35 + 0.65 * centrality) * solidity
+            if edges_touched == 1:
+                score *= 0.25
 
             if score > best_score:
                 best_score = score
